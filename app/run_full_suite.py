@@ -117,9 +117,9 @@ def main():
             ("ivf_fp32",                "ivf_fp32_baseline.csv",                         ""),
             ("dbam_direct_baseline",    f"dbam_direct_baseline_m{ms_tag}.csv",          ""),
             ("dbam_dual_baseline",      f"dbam_dual_baseline_m{ms_tag}.csv",            ""),
-            ("ivf_fp32_adapter",        "ivf_fp32_with_adapter.csv",                    adapter_suffix),
-            ("dbam_direct_adapter",     f"dbam_direct_with_adapter_m{ms_tag}.csv",      adapter_suffix),
-            ("dbam_dual_adapter",       f"dbam_dual_with_adapter_m{ms_tag}.csv",        adapter_suffix),
+            # ("ivf_fp32_adapter",        "ivf_fp32_with_adapter.csv",                    adapter_suffix),
+            # ("dbam_direct_adapter",     f"dbam_direct_with_adapter_m{ms_tag}.csv",      adapter_suffix),
+            # ("dbam_dual_adapter",       f"dbam_dual_with_adapter_m{ms_tag}.csv",        adapter_suffix),
         ]
 
         for mode, fname, extra in jobs:
