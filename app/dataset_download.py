@@ -5,11 +5,13 @@ import json
 import argparse
 import numpy as np
 import torch
-from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
 
 
 def make_logger(log_path: str):
+    """
+    Simple tee logger: prints to stdout and appends to a log file.
+    """
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     f = open(log_path, "a", buffering=1)
 
@@ -24,38 +26,50 @@ def make_logger(log_path: str):
 
 def resolve_out_path(data_dir: str, dataset: str, log):
     """
-    Pick a filename consistent with your NRP code expectations.
+    Choose output filename consistent with your NRP code expectations.
     """
-    # Explicit mappings for your known setups
     if dataset in ("hotpotqa", "hotpotqa_mpnet"):
         name = "sample_passage_embeddings_hotpotqa.npy"
     elif dataset in ("beir_nq", "beir_nq_mpnet"):
         name = "sample_passage_embeddings_nq.npy"
     else:
-        # Fallback: dataset-specific
+        # Generic fallback for any future dataset
         name = f"sample_passage_embeddings_{dataset}.npy"
+
     out_path = os.path.join(data_dir, name)
     log(f"[config] Using output file: {out_path}")
     return out_path
+
+
+def count_lines(path: str) -> int:
+    """
+    Count number of lines in a file. Used to size memmap.
+    """
+    c = 0
+    with open(path, "r", encoding="utf-8") as f:
+        for _ in f:
+            c += 1
+    return c
 
 
 def build_passage_embeddings_mpnet(data_dir: str, dataset: str, batch_size: int, log):
     corpus_path = os.path.join(data_dir, "corpus.jsonl")
     out_path = resolve_out_path(data_dir, dataset, log)
 
-    # Sanity checks
+    # Sanity: corpus exists
     if not os.path.exists(corpus_path):
         log(f"❌ corpus.jsonl not found at: {corpus_path}")
         sys.exit(1)
 
+    # If embeddings already exist and are loadable, skip
     if os.path.exists(out_path):
         try:
-            emb = np.load(out_path)
+            emb = np.load(out_path, mmap_mode="r")
             log(f"🔄 Found existing embeddings at: {out_path}")
             log(f"   Existing embeddings shape: {emb.shape}, dtype: {emb.dtype}")
             return
         except Exception as e:
-            log(f"⚠️ Failed to load existing embeddings at {out_path}, will recompute. Error: {e}")
+            log(f"⚠️ Existing embeddings at {out_path} are unreadable, will recompute. Error: {e}")
 
     # Device + model
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -70,46 +84,122 @@ def build_passage_embeddings_mpnet(data_dir: str, dataset: str, batch_size: int,
     log(f"[model] Loading encoder: {model_name}")
     encoder = SentenceTransformer(model_name, device=device)
 
-    # Load passages
-    log(f"[data] Reading corpus from: {corpus_path}")
-    passage_texts = []
-    with open(corpus_path, "r", encoding="utf-8") as f:
-        for line in tqdm(f, desc="Loading corpus", mininterval=5.0):
+    # Count total passages first (cheap; needed for memmap shape)
+    log(f"[data] Counting lines in corpus: {corpus_path}")
+    total_passages = count_lines(corpus_path)
+    if total_passages == 0:
+        log("❌ No passages found in corpus.jsonl")
+        sys.exit(1)
+    log(f"[data] Total passages: {total_passages}")
+
+    # Now encode in a streaming fashion and write directly into memmap
+    log(f"[encode] Starting encoding with batch_size={batch_size}")
+
+    # Reopen corpus for actual reading
+    f = open(corpus_path, "r", encoding="utf-8")
+
+    # ---- First batch: determine embedding dim + init memmap ----
+    first_lines = []
+    for _ in range(batch_size):
+        line = f.readline()
+        if not line:
+            break
+        first_lines.append(line)
+
+    if not first_lines:
+        log("❌ Failed to read even a single passage from corpus.")
+        f.close()
+        sys.exit(1)
+
+    first_texts = []
+    for line in first_lines:
+        obj = json.loads(line)
+        text = (obj.get("title", "") + " " + obj.get("text", "")).strip()
+        first_texts.append(text)
+
+    first_emb = encoder.encode(
+        first_texts,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+    )
+    if first_emb.ndim != 2:
+        log(f"❌ Unexpected embedding shape for first batch: {first_emb.shape}")
+        f.close()
+        sys.exit(1)
+
+    d = first_emb.shape[1]
+    log(f"[encode] Embedding dimension: {d}")
+
+    # Create memmap backing file: (total_passages, d)
+    mm = np.memmap(out_path, dtype="float32", mode="w+", shape=(total_passages, d))
+
+    # Write first batch
+    n_first = first_emb.shape[0]
+    mm[0:n_first, :] = first_emb.astype("float32")
+    mm.flush()
+    offset = n_first
+    log(f"[encode] batch=0 done={offset}/{total_passages} ({offset/total_passages*100:.4f}%)")
+
+    # ---- Remaining batches ----
+    batch_idx = 1
+    while True:
+        lines = []
+        for _ in range(batch_size):
+            line = f.readline()
+            if not line:
+                break
+            lines.append(line)
+
+        if not lines:
+            break  # EOF
+
+        texts = []
+        for line in lines:
             obj = json.loads(line)
             text = (obj.get("title", "") + " " + obj.get("text", "")).strip()
-            passage_texts.append(text)
-
-    n = len(passage_texts)
-    log(f"[data] Total passages: {n}")
-
-    # Encode in batches
-    all_chunks = []
-    log(f"[encode] Encoding passages with batch_size={batch_size} ...")
-    for i in range(0, n, batch_size):
-        batch = passage_texts[i:i + batch_size]
+            texts.append(text)
 
         emb = encoder.encode(
-            batch,
+            texts,
             convert_to_numpy=True,
             show_progress_bar=False,
         )
-        all_chunks.append(emb)
 
-        # Verbose progress every 100 batches (or at end)
-        batch_idx = i // batch_size
-        if (batch_idx % 100) == 0 or (i + batch_size) >= n:
-            done = min(i + batch_size, n)
-            pct = (done / n) * 100.0
-            log(f"[encode] {done}/{n} ({pct:.2f}%) passages encoded")
+        if emb.ndim != 2:
+            log(f"❌ Unexpected embedding shape at batch {batch_idx}: {emb.shape}")
+            f.close()
+            del mm
+            sys.exit(1)
 
-    embeddings = np.vstack(all_chunks).astype("float32")
-    log(f"[encode] Final embeddings shape: {embeddings.shape}, dtype: {embeddings.dtype}")
+        bsz = emb.shape[0]
+        end = offset + bsz
+        if end > total_passages:
+            log(f"⚠️ Computed end index {end} > total_passages {total_passages}, clipping.")
+            end = total_passages
+            bsz = end - offset
+            emb = emb[:bsz]
 
-    # Save
-    np.save(out_path, embeddings)
-    log(f"✅ Saved embeddings to: {out_path}")
+        mm[offset:end, :] = emb.astype("float32")
+        mm.flush()
+        offset = end
 
-    # Quick verify
+        pct = (offset / total_passages) * 100.0
+        log(f"[encode] batch={batch_idx} done={offset}/{total_passages} ({pct:.4f}%)")
+
+        batch_idx += 1
+
+        if offset >= total_passages:
+            break
+
+    f.close()
+    del mm  # ensure data is flushed
+
+    if offset != total_passages:
+        log(f"⚠️ Finished with offset={offset}, expected={total_passages}. Some passages may be missing.")
+    else:
+        log("[encode] All passages encoded successfully.")
+
+    # Reload check
     try:
         test = np.load(out_path, mmap_mode="r")
         log(f"🔍 Reload check OK: {test.shape}, dtype: {test.dtype}")
@@ -117,21 +207,38 @@ def build_passage_embeddings_mpnet(data_dir: str, dataset: str, batch_size: int,
         log(f"❌ Reload check FAILED for {out_path}: {e}")
         sys.exit(1)
 
+    log(f"✅ Saved embeddings to: {out_path}")
+
 
 def main():
     parser = argparse.ArgumentParser(
         description="Generate MPNet passage embeddings on PVC."
     )
-    parser.add_argument("--data_root", default="/mnt/work/datasets")
-    parser.add_argument("--dataset", required=True,
-                        help="E.g. hotpotqa_mpnet, beir_nq_mpnet")
-    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument(
+        "--data_root",
+        default="/mnt/work/datasets",
+        help="Root directory where datasets live (inside PVC).",
+    )
+    parser.add_argument(
+        "--dataset",
+        required=True,
+        help="Dataset name, e.g. hotpotqa_mpnet, beir_nq_mpnet.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=512,
+        help="Batch size for encoding.",
+    )
     args = parser.parse_args()
 
     data_dir = os.path.join(args.data_root, args.dataset)
     os.makedirs(data_dir, exist_ok=True)
 
-    log_path = os.path.join(data_dir, f"gen_{args.dataset}_mpnet.log")
+    log_path = os.path.join(
+        data_dir,
+        f"gen_{args.dataset}_mpnet.log",
+    )
     log = make_logger(log_path)
 
     log(f"=== MPNet embedding generation for {args.dataset} ===")
